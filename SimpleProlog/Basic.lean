@@ -47,6 +47,27 @@ def apply (t : Term vars const) (s : Subst vars const) : Term vars const :=
   | con c => con c
   | app t1 t2 => app (apply t1 s) (apply t2 s)
 
+
+def applyAndMark (t : Term vars const) (s : Subst vars const) : Bool × Term vars const :=
+  match t with
+  | var v =>
+    if v ∈ s.domain then
+      (true, s.map v)
+    else
+      (false, var v)
+  | con c => (false, con c)
+  | app t1 t2 =>
+    let (m1, t1') := applyAndMark t1 s
+    let (m2, t2') := applyAndMark t2 s
+    (m1 || m2, app t1' t2')
+
+partial def applyFull (t : Term vars const) (s : Subst vars const) : Term vars const :=
+  let (b, t') := applyAndMark t s
+  if b then
+    applyFull t' s
+  else
+    t'
+
 #eval
 let s : Subst String String := {
   domain := ["x", "y"],
@@ -80,11 +101,14 @@ def Subst.single (v : vars) (t : Term vars const) : Subst vars const :=
     map := fun _ => t
   }
 
-def occurs (v : vars) (t : Term vars const) : Bool :=
+partial def occurs (v : vars) (t : Term vars const) (σ : Subst vars const) : Bool :=
   match t with
-  | var v' => v = v'
+  | var v' =>
+    if v' ∈ σ.domain then
+      occurs v (σ.map v') σ
+    else if v = v' then true else false
   | con _ => false
-  | app t1 t2 => occurs v t1 || occurs v t2
+  | app t1 t2 => occurs v t1 σ || occurs v t2 σ
 
 end Term
 
@@ -128,8 +152,9 @@ partial def unifyStepNorm (e : EqConstr vars const)
   | (var v, t)
   | (t, var v) =>
     do
+      let σ ← get
       -- occurs check
-      if occurs v t then
+      if occurs v t σ then
         throw ()
       else
         do
@@ -162,3 +187,34 @@ open Term Unification
 
 #eval ({ lhs := app (var "x") (con "a"), rhs := app (con "b") (var "y") } : EqConstr String String)
 #eval Unification.unifyOne { lhs := app (var "x") (con "a"), rhs := app (con "b") (var "y") }
+
+namespace Clause
+
+structure Clause (vars const : Type) where
+  head : Term vars const
+  body : List (Term vars const)
+deriving Repr, Inhabited
+
+class GenSym (α : Type) where
+  genSym : List α → α → α
+
+class LawfulGenSym (α : Type) [DecidableEq α] [GenSym α] where
+  genSym_fresh : ∀ (used : List α) (base : α), GenSym.genSym used base ∉ used
+
+#print Nat.toDigits
+#print instToStringNat
+#print Nat.repr
+
+-- TODO: prove termination.
+partial instance instGenSymString : GenSym String where
+  genSym used base :=
+    aux used base 0
+  where
+  aux used base (n : Nat) :=
+    let candidate := base ++ "_" ++ toString n
+    if candidate ∈ used then
+      aux used base (n + 1)
+    else
+      candidate
+
+end Clause
