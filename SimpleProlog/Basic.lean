@@ -112,6 +112,21 @@ partial def occurs (v : vars) (t : Term vars const) (σ : Subst vars const) : Bo
   | con _ => false
   | app t1 t2 => occurs v t1 σ || occurs v t2 σ
 
+def collectVars (t : Term vars const) (acc : List vars) : List vars :=
+  match t with
+  | var v =>
+    if v ∈ acc then
+      acc
+    else
+      v :: acc
+  | con _ => acc
+  | app t1 t2 =>
+    let acc1 := collectVars t1 acc
+    collectVars t2 acc1
+
+def collectVarsList (ts : List (Term vars const)) : List vars :=
+  ts.foldl (fun acc t => collectVars t acc) []
+
 end Term
 
 namespace Unification
@@ -284,5 +299,36 @@ partial instance instGenSymString : GenSym String where
       aux used base (n + 1)
     else
       candidate
+
+variable [DecidableEq α] [GenSym α]
+
+#check Array.indexOf?
+#check List.toArray
+
+def freshSubst [Inhabited α] (used : List α) : Subst α const :=
+  let freshVars :=
+    used.map (fun v => GenSym.genSym used v)
+  let freshVars := freshVars.toArray
+  let usedArray := used.toArray
+  let s : Subst α const :=
+    {
+      domain := used,
+      map := fun v =>
+        let idx := usedArray.indexOf? v
+        match idx with
+        | some i => var (freshVars[i]!)
+        | none => var v
+    }
+  s
+
+def freshen [Inhabited α] (used : List α) (cl : Clause α const) : Clause α const :=
+  let s := freshSubst used
+  {
+    head := cl.head.apply s,
+    body := cl.body.map (fun t => t.apply s)
+  }
+
+-- Now we need to freshen the head of a clause, unify it against the goal, and return the updated
+-- substitution and body constraints.
 
 end Clause
