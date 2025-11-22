@@ -1,6 +1,8 @@
 /-
 Author: Cody Roux
 -/
+import Lean
+
 
 variable {vars : Type} {const : Type}
 
@@ -184,6 +186,72 @@ def unifyOne (e : EqConstr vars const) : Except Unit (Subst vars const) :=
 end Unification
 
 open Term Unification
+
+
+section TermDSL
+
+open Lean Elab Meta
+
+-- We create a little elaborator for terms
+declare_syntax_cat p_lit
+syntax ident : p_lit
+
+def elabPLit : Syntax → MetaM Expr
+  | `(p_lit| $id:ident) =>
+    let id := id.getId.toString
+    if id.front.isUpper then
+      mkAppOptM ``Term.var #[none, mkConst ``String, mkStrLit id]
+    else
+      mkAppOptM ``Term.con #[mkConst ``String, none, mkStrLit id]
+  | _ => throwError "unexpected syntax"
+
+elab "test_elabPLit " p:p_lit : term => do
+  let t ← elabPLit p
+  logInfo m!"elaborated term: {t}"
+  return t
+
+#reduce test_elabPLit x
+
+#reduce test_elabPLit X
+
+
+declare_syntax_cat p_term
+syntax p_lit : p_term
+syntax p_lit "(" p_term,* ")" : p_term
+
+partial def elabPTerm : Syntax → MetaM Expr
+  | `(p_term| $lit:p_lit) =>
+    elabPLit lit
+  | `(p_term| $lit:p_lit ( $args:p_term,* )) =>
+    do
+      let func ← elabPLit lit
+      let argExprs ← args.getElems.mapM elabPTerm
+      let mut result := func
+      for arg in argExprs do
+        result ← mkAppM ``Term.app #[result, arg]
+      return result
+  | _ => throwError "unexpected syntax"
+
+elab "test_elabPTerm " t:p_term : term => do
+  let t ← elabPTerm t
+  logInfo m!"elaborated term: {t}"
+  return t
+
+#reduce test_elabPTerm f(x, Y, g(a))
+
+elab "test_unify " t:p_term u:p_term : term => do
+  let t ← elabPTerm t
+  let u ← elabPTerm u
+  let eqConstr ← mkAppM ``EqConstr.mk #[t, u]
+  let unifyCall ← mkAppM ``Unification.unifyOne #[eqConstr]
+  logInfo m!"unification result: {unifyCall}"
+  return unifyCall
+
+#reduce test_unify f(X, a) f(b, Y)
+
+#eval test_unify f(X, a) f(b, Y)
+
+end TermDSL
 
 #eval ({ lhs := app (var "x") (con "a"), rhs := app (con "b") (var "y") } : EqConstr String String)
 #eval Unification.unifyOne { lhs := app (var "x") (con "a"), rhs := app (con "b") (var "y") }
