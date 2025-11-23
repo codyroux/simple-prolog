@@ -8,38 +8,37 @@ variable {vars : Type} {const : Type}
 
 variable [DecidableEq vars] [DecidableEq const]
 
-inductive Term (vars const : Type) where
-| var : vars → Term vars const
-| con : const → Term vars const
-| app : Term vars const → Term vars const → Term vars const
+inductive PTerm (vars const : Type) where
+| var : vars → PTerm vars const
+| con : const → PTerm vars const
+| app : PTerm vars const → PTerm vars const → PTerm vars const
 deriving DecidableEq, Repr, Inhabited
 
-instance instToStringTerm [ToString vars] [ToString const] : ToString (Term vars const) where
+instance instToStringTerm [ToString vars] [ToString const] : ToString (PTerm vars const) where
   toString t := aux t
   where
-    aux : Term vars const → String
+    aux : PTerm vars const → String
     | .var v => toString v
     | .con c => toString c
     | .app t1 t2 => "(" ++ aux t1 ++ " " ++ aux t2 ++ ")"
 
-#print Term
+namespace PTerm
 
-#synth Inhabited <| Term String String
-
-#print instInhabitedTerm
-
-namespace Term
+def getVars : PTerm vars const → List vars
+  | var v => [v]
+  | con _ => []
+  | app t1 t2 => (getVars t1) ++ (getVars t2)
 
 structure Subst (vars const : Type) where
   domain : List vars
-  map : vars → Term vars const
+  map : vars → PTerm vars const
 
 instance instToStringSubst [ToString vars] [ToString const] : ToString (Subst vars const) where
   toString s :=
     let mappings := s.domain.map (fun v => toString v ++ " ↦ " ++ toString (s.map v))
     "{" ++ String.intercalate ", " mappings ++ "}"
 
-def apply (t : Term vars const) (s : Subst vars const) : Term vars const :=
+def apply (t : PTerm vars const) (s : Subst vars const) : PTerm vars const :=
   match t with
   | var v =>
     if v ∈ s.domain then
@@ -49,8 +48,7 @@ def apply (t : Term vars const) (s : Subst vars const) : Term vars const :=
   | con c => con c
   | app t1 t2 => app (apply t1 s) (apply t2 s)
 
-
-def applyAndMark (t : Term vars const) (s : Subst vars const) : Bool × Term vars const :=
+def applyAndMark (t : PTerm vars const) (s : Subst vars const) : Bool × PTerm vars const :=
   match t with
   | var v =>
     if v ∈ s.domain then
@@ -63,7 +61,7 @@ def applyAndMark (t : Term vars const) (s : Subst vars const) : Bool × Term var
     let (m2, t2') := applyAndMark t2 s
     (m1 || m2, app t1' t2')
 
-partial def applyFull (t : Term vars const) (s : Subst vars const) : Term vars const :=
+partial def applyFull (t : PTerm vars const) (s : Subst vars const) : PTerm vars const :=
   let (b, t') := applyAndMark t s
   if b then
     applyFull t' s
@@ -97,13 +95,13 @@ def Subst.empty : Subst vars const :=
     map := fun v => var v
   }
 
-def Subst.single (v : vars) (t : Term vars const) : Subst vars const :=
+def Subst.single (v : vars) (t : PTerm vars const) : Subst vars const :=
   {
     domain := [v],
     map := fun _ => t
   }
 
-partial def occurs (v : vars) (t : Term vars const) (σ : Subst vars const) : Bool :=
+partial def occurs (v : vars) (t : PTerm vars const) (σ : Subst vars const) : Bool :=
   match t with
   | var v' =>
     if v' ∈ σ.domain then
@@ -112,7 +110,7 @@ partial def occurs (v : vars) (t : Term vars const) (σ : Subst vars const) : Bo
   | con _ => false
   | app t1 t2 => occurs v t1 σ || occurs v t2 σ
 
-def collectVars (t : Term vars const) (acc : List vars) : List vars :=
+def collectVars (t : PTerm vars const) (acc : List vars) : List vars :=
   match t with
   | var v =>
     if v ∈ acc then
@@ -124,21 +122,41 @@ def collectVars (t : Term vars const) (acc : List vars) : List vars :=
     let acc1 := collectVars t1 acc
     collectVars t2 acc1
 
-def collectVarsList (ts : List (Term vars const)) : List vars :=
+def collectVarsList (ts : List (PTerm vars const)) : List vars :=
   ts.foldl (fun acc t => collectVars t acc) []
 
-end Term
+end PTerm
 
 namespace Unification
 
 structure EqConstr (vars const : Type) where
-  lhs : Term vars const
-  rhs : Term vars const
+  lhs : PTerm vars const
+  rhs : PTerm vars const
 deriving Repr, Inhabited
 
-open Term
+open PTerm
 
-abbrev UnifyM vars const α := StateT (Subst vars const) (Except Unit) α
+inductive UnifyError (vars const : Type) where
+  | occursCheckFailed : vars → PTerm vars const → UnifyError vars const
+  | constructorMismatch : const → const → UnifyError vars const
+  | shapeMismatch : PTerm vars const → PTerm vars const → UnifyError vars const
+deriving Repr
+
+instance [ToString vars] [ToString const]: ToString (UnifyError vars const) where
+  toString
+    | UnifyError.occursCheckFailed v t =>
+      "Occurs check failed: variable " ++ toString v ++ " occurs in term " ++ toString t
+    | UnifyError.constructorMismatch c1 c2 =>
+      "Constructor mismatch: " ++ toString c1 ++ " vs " ++ toString c2
+    | UnifyError.shapeMismatch t1 t2 =>
+      "Shape mismatch between terms: " ++ toString t1 ++ " and " ++ toString t2
+
+
+abbrev UnifyM vars const α := StateT (Subst vars const) (Except (UnifyError vars const)) α
+
+partial def UnifyM.run {α} (m : UnifyM vars const α)
+ : Except (UnifyError vars const) (Subst vars const) :=
+  StateT.run m Subst.empty |> Except.map Prod.snd
 
 mutual
 
@@ -172,7 +190,7 @@ partial def unifyStepNorm (e : EqConstr vars const)
       let σ ← get
       -- occurs check
       if occurs v t σ then
-        throw ()
+        throw (UnifyError.occursCheckFailed v t)
       else
         do
           let s ← get
@@ -183,24 +201,24 @@ partial def unifyStepNorm (e : EqConstr vars const)
     if c1 = c2 then
       pure []
     else
-      throw ()
+      throw (UnifyError.constructorMismatch c1 c2)
   | (app l1 r1, app l2 r2) =>
     pure [{ lhs := l1, rhs := l2 }, { lhs := r1, rhs := r2 }]
   | _ =>
-    throw ()
+    throw (UnifyError.shapeMismatch e.lhs e.rhs)
 
 end
 
 
-def unify (eqs : List (EqConstr vars const)) : Except Unit (Subst vars const) :=
-  Prod.snd <$> (unifyAux eqs).run (Subst.empty)
+def unify (eqs : List (EqConstr vars const)) : Except (UnifyError vars const) (Subst vars const) :=
+  (unifyAux eqs).run
 
-def unifyOne (e : EqConstr vars const) : Except Unit (Subst vars const) :=
+def unifyOne (e : EqConstr vars const) : Except (UnifyError vars const) (Subst vars const) :=
   unify [e]
 
 end Unification
 
-open Term Unification
+open PTerm Unification
 
 
 section TermDSL
@@ -215,20 +233,18 @@ def elabPLit : Syntax → MetaM Expr
   | `(p_lit| $id:ident) =>
     let id := id.getId.toString
     if id.front.isUpper then
-      mkAppOptM ``Term.var #[none, mkConst ``String, mkStrLit id]
+      mkAppOptM ``PTerm.var #[none, mkConst ``String, mkStrLit id]
     else
-      mkAppOptM ``Term.con #[mkConst ``String, none, mkStrLit id]
+      mkAppOptM ``PTerm.con #[mkConst ``String, none, mkStrLit id]
   | _ => throwError "unexpected syntax"
 
 elab "test_elabPLit " p:p_lit : term => do
   let t ← elabPLit p
-  logInfo m!"elaborated term: {t}"
   return t
 
 #reduce test_elabPLit x
 
 #reduce test_elabPLit X
-
 
 declare_syntax_cat p_term
 syntax p_lit : p_term
@@ -243,14 +259,17 @@ partial def elabPTerm : Syntax → MetaM Expr
       let argExprs ← args.getElems.mapM elabPTerm
       let mut result := func
       for arg in argExprs do
-        result ← mkAppM ``Term.app #[result, arg]
+        result ← mkAppM ``PTerm.app #[result, arg]
       return result
   | _ => throwError "unexpected syntax"
 
 elab "test_elabPTerm " t:p_term : term => do
   let t ← elabPTerm t
-  logInfo m!"elaborated term: {t}"
   return t
+
+#check `(p_term| f ( a, b, X ))
+
+-- TODO: create a delaborator for Term to make the output prettier.
 
 #reduce test_elabPTerm f(x, Y, g(a))
 
@@ -262,9 +281,10 @@ elab "test_unify " t:p_term u:p_term : term => do
   logInfo m!"unification result: {unifyCall}"
   return unifyCall
 
-#reduce test_unify f(X, a) f(b, Y)
-
 #eval test_unify f(X, a) f(b, Y)
+
+#eval test_unify f(X, a) f(b, X)
+
 
 end TermDSL
 
@@ -274,8 +294,8 @@ end TermDSL
 namespace Clause
 
 structure Clause (vars const : Type) where
-  head : Term vars const
-  body : List (Term vars const)
+  head : PTerm vars const
+  body : List (PTerm vars const)
 deriving Repr, Inhabited
 
 class GenSym (α : Type) where
@@ -300,28 +320,27 @@ partial instance instGenSymString : GenSym String where
     else
       candidate
 
-variable [DecidableEq α] [GenSym α]
+variable [Inhabited vars] [DecidableEq vars] [GenSym vars]
 
-#check Array.indexOf?
 #check List.toArray
 
-def freshSubst [Inhabited α] (used : List α) : Subst α const :=
+def freshSubst (used : List vars) : Subst vars const :=
   let freshVars :=
     used.map (fun v => GenSym.genSym used v)
   let freshVars := freshVars.toArray
   let usedArray := used.toArray
-  let s : Subst α const :=
+  let s : Subst vars const :=
     {
       domain := used,
       map := fun v =>
-        let idx := usedArray.indexOf? v
+        let idx := usedArray.idxOf? v
         match idx with
         | some i => var (freshVars[i]!)
         | none => var v
     }
   s
 
-def freshen [Inhabited α] (used : List α) (cl : Clause α const) : Clause α const :=
+def freshen (used : List vars) (cl : Clause vars const) : Clause vars const :=
   let s := freshSubst used
   {
     head := cl.head.apply s,
@@ -330,5 +349,42 @@ def freshen [Inhabited α] (used : List α) (cl : Clause α const) : Clause α c
 
 -- Now we need to freshen the head of a clause, unify it against the goal, and return the updated
 -- substitution and body constraints.
+def applyToClause (cl : Clause vars const) (t : PTerm vars const)
+ : UnifyM vars const (List (PTerm vars const)) := do
+  let vars := t.getVars
+  let cl := freshen vars cl
+  unifyAux [{ lhs := cl.head, rhs := t }]
+  let s ← get
+  return cl.body.map (fun t => t.apply s)
+
+-- FIXME: Do we need to keep track of all the vraiables in every clause body?
+
+declare_syntax_cat p_clause
+syntax p_term "-:" p_term,* : p_clause
+
+open Lean Elab Meta
+
+partial def elabPClause : Syntax → MetaM Expr
+  | `(p_clause| $t:p_term -: $args:p_term,* ) =>
+    do
+      let head ← elabPTerm t
+      let argExprs ← args.getElems.mapM elabPTerm
+      let termTy ← mkAppOptM ``PTerm #[mkConst ``String, mkConst ``String]
+      let bodyList ←
+        argExprs.foldrM (fun arg acc => do
+          let accExpr ← acc
+          return mkAppM ``List.cons #[arg, accExpr])
+          (mkAppOptM ``List.nil #[termTy])
+      mkAppM ``Clause.mk #[head, ← bodyList]
+  | _ => throwError "unexpected syntax"
+
+elab "test_elabPClause " c:p_clause : term => do
+  let c ← elabPClause c
+  return c
+
+#reduce test_elabPClause f(X) -: g(a, Y), h(X)
+
+#eval applyToClause (test_elabPClause f(X) -: g(a, Y), h(X)) (test_elabPTerm f(b)) |> UnifyM.run
+#eval applyToClause (test_elabPClause f(X) -: g(a, Y), h(X)) (test_elabPTerm f(X)) |> UnifyM.run
 
 end Clause
