@@ -367,6 +367,7 @@ def withFreshRenaming
         match idx with
         | some i => (freshVarsArray[i]!)
         | none => v
+  -- FIXME: remove dups
   withReader (fun used => used ++ freshVars) (cont ren)
 
 #check withReader
@@ -417,21 +418,23 @@ def applyToClause
   [MonadWithReaderOf (List vars) m]
   [MonadReaderOf (List vars) m]
   [MonadExcept (UnifyError vars const) m]
+  (cont : List (PTerm vars const) → m α)
   (cl : Clause vars const) (t : PTerm vars const)
- : m (List (PTerm vars const)) := do
-  withReader (fun used => used ++ (t.getVars)) <| do
+ : m α := do
+  withReader (fun used => used ++ t.getVars) <| do
   withFreshClause cl <| fun cl' =>
     withUnifyM
       (do
         let s ← getSol
         let body' := cl'.body.map (fun b => b.applyFull s)
-        return body')
+        cont body')
       [{ lhs := cl'.head, rhs := t }]
 
 
 structure PState (vars const : Type) where
   usedVars : List vars
   subst : Subst vars const
+  goals : List (PTerm vars const)
 deriving Inhabited
 
 abbrev GoalM vars const := ExceptT (UnifyError vars const) (ReaderM (PState vars const))
@@ -471,7 +474,7 @@ def GoalM.run
 def testApplyClause
   (cl : Clause vars const) (t : PTerm vars const)
  : GoalM vars const (List (PTerm vars const)) := do
-  applyToClause cl t
+  applyToClause (fun l => return l) cl t
 
 declare_syntax_cat p_clause
 syntax p_term "-:" p_term,* : p_clause
