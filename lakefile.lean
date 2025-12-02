@@ -1,6 +1,10 @@
 import Lake
 open Lake DSL
 
+-- We depend on Batteries for MLList
+require batteries from git
+  "https://github.com/leanprover-community/batteries.git" @ "main"
+
 package «simple-prolog» where
   -- add package configuration options here
 

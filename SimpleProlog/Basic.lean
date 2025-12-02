@@ -2,7 +2,7 @@
 Author: Cody Roux
 -/
 import Lean
-
+import Batteries.Data.MLList
 
 variable {vars : Type} {const : Type}
 
@@ -411,7 +411,7 @@ def withUnifyM
 
 -- Now we need to freshen the head of a clause, unify it against the goal, and return the updated
 -- substitution and body constraints.
-def applyToClause
+def applyClause
   [Monad m]
   [MonadWithReaderOf (Subst vars const) m]
   [MonadReaderOf (Subst vars const) m]
@@ -430,6 +430,20 @@ def applyToClause
         cont body')
       [{ lhs := cl'.head, rhs := t }]
 
+def withApplyClause
+  [Monad m]
+  [MonadWithReaderOf (Subst vars const) m]
+  [MonadReaderOf (Subst vars const) m]
+  [MonadWithReaderOf (List vars) m]
+  [MonadReaderOf (List vars) m]
+  [MonadExcept (UnifyError vars const) m]
+  [MonadWithReaderOf (List (PTerm vars const)) m]
+  (cl : Clause vars const) (t : PTerm vars const)
+  (cont : m α)
+ : m α :=
+  let cont' := fun new_goals =>
+  withReader (fun s => new_goals ++ s) cont
+  applyClause cont' cl t
 
 structure PState (vars const : Type) where
   usedVars : List vars
@@ -438,10 +452,6 @@ structure PState (vars const : Type) where
 deriving Inhabited
 
 abbrev GoalM vars const := ExceptT (UnifyError vars const) (ReaderM (PState vars const))
-
-instance : MonadReaderOf (PState vars const) (GoalM vars const) := inferInstance
-
-instance : MonadWithReaderOf (PState vars const) (GoalM vars const) := inferInstance
 
 instance : MonadReaderOf (List vars) (GoalM vars const) where
   read := do
@@ -452,6 +462,16 @@ instance : MonadReaderOf (Subst vars const) (GoalM vars const) where
   read := do
     let s : PState vars const ← MonadReaderOf.read
     return s.subst
+
+instance : MonadReaderOf (List (PTerm vars const)) (GoalM vars const) where
+  read := do
+    let s : PState vars const ← MonadReaderOf.read
+    return s.goals
+
+instance : MonadReaderOf (List (PTerm vars const)) (GoalM vars const) where
+  read := do
+    let s : PState vars const ← MonadReaderOf.read
+    return s.goals
 
 instance : MonadWithReaderOf (List vars) (GoalM vars const) where
   withReader f cont := do
@@ -465,16 +485,28 @@ instance : MonadWithReaderOf (Subst vars const) (GoalM vars const) where
     let s' := { s with subst := f s.subst }
     MonadWithReaderOf.withReader (fun _ => s') cont
 
+instance : MonadWithReaderOf (List (PTerm vars const)) (GoalM vars const) where
+  withReader f cont := do
+    let s : PState vars const ← MonadReaderOf.read
+    let s' := { s with goals := f s.goals }
+    MonadWithReaderOf.withReader (fun _ => s') cont
+
 def GoalM.run
   (m : GoalM vars const α)
-  (init : PState vars const := { usedVars := [], subst := Subst.empty })
+  (init : PState vars const := { usedVars := [], subst := Subst.empty, goals := [] })
  : Except (UnifyError vars const) α :=
   ReaderT.run (ExceptT.run m) init
 
 def testApplyClause
   (cl : Clause vars const) (t : PTerm vars const)
  : GoalM vars const (List (PTerm vars const)) := do
-  applyToClause (fun l => return l) cl t
+  applyClause (fun l => return l) cl t
+
+def testWithApplyClause
+  (cl : Clause vars const) (t : PTerm vars const)
+ : GoalM vars const (List (PTerm vars const)) := do
+  withApplyClause cl t read
+
 
 declare_syntax_cat p_clause
 syntax p_term "-:" p_term,* : p_clause
@@ -499,9 +531,54 @@ elab "test_elabPClause " c:p_clause : term => do
   let c ← elabPClause c
   return c
 
+
 #reduce test_elabPClause f(X, Y) -: g(a, Y), h(X)
 
 #eval testApplyClause (test_elabPClause f(X, Y) -: g(a, Y), h(X)) (test_elabPTerm f(b, a)) |> GoalM.run
 #eval testApplyClause (test_elabPClause f(X, Y) -: g(a, Y), h(X)) (test_elabPTerm f(Y, X)) |> GoalM.run
+#eval testWithApplyClause (test_elabPClause f(X, Y) -: g(a, Y), h(X)) (test_elabPTerm f(b, a)) |> GoalM.run
+#eval testWithApplyClause (test_elabPClause f(X, Y) -: g(a, Y), h(X)) (test_elabPTerm f(Y, X)) |> GoalM.run
+
 
 end Clause
+
+section Program
+
+open Clause
+
+#check PTerm
+
+
+variable {vars const : Type}
+  [DecidableEq vars]
+  [DecidableEq const]
+  [Inhabited vars]
+  [GenSym vars]
+
+structure Program vars const where
+  clauses : MLList Id (Clause vars const)
+deriving Inhabited
+
+def Program.ofList (cls : List (Clause vars const)) : Program vars const :=
+  {
+    clauses := MLList.ofList cls
+  }
+
+def Program.step
+  (cl : Clause vars const)
+  (cont : GoalM vars const (Subst vars const))
+  : GoalM vars const (Subst vars const) := do
+  let goals : List (PTerm vars const) ← read
+  match goals with
+  | [] => MonadReaderOf.read
+  | g::_ =>
+      Clause.withApplyClause cl g cont
+
+
+partial def Program.run
+  (P : Program vars const)
+  : MLList Id (GoalM vars const (Subst vars const)) := do
+  let cl ← P.clauses
+  Program.step cl <$> (Program.run P)
+
+end Program
