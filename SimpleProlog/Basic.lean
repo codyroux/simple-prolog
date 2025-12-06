@@ -546,8 +546,6 @@ section Program
 
 open Clause
 
-#check PTerm
-
 
 variable {vars const : Type}
   [DecidableEq vars]
@@ -555,8 +553,10 @@ variable {vars const : Type}
   [Inhabited vars]
   [GenSym vars]
 
+abbrev RStream := MLList Id
+
 structure Program vars const where
-  clauses : MLList Id (Clause vars const)
+  clauses : RStream (Clause vars const)
 deriving Inhabited
 
 def Program.ofList (cls : List (Clause vars const)) : Program vars const :=
@@ -575,10 +575,54 @@ def Program.step
       Clause.withApplyClause cl g cont
 
 
-partial def Program.run
+partial def Program.eval
   (P : Program vars const)
-  : MLList Id (GoalM vars const (Subst vars const)) := do
+  : RStream (GoalM vars const (Subst vars const)) := do
   let cl ← P.clauses
-  Program.step cl <$> (Program.run P)
+  Program.step cl <$> (Program.eval P)
+
+private def test_clause_1 : Clause String String :=
+  test_elabPClause concat(nil, X, X) -:
+
+private def test_clause_2 : Clause String String :=
+  test_elabPClause concat(cons(X, Y), Z, cons(X, W)) -: concat(Y, Z, W)
+
+private def test_prog : Program String String := Program.ofList [test_clause_1, test_clause_2]
+
+private def test_goal : PTerm String String :=
+  test_elabPTerm concat(cons(a, cons(b, nil)), cons(c, nil))
+
+def mkInitGoal (goal : PTerm vars const) : PState vars const :=
+  {
+    usedVars := goal.getVars,
+    subst := Subst.empty,
+    goals := [goal]
+  }
+
+def runResOne (initGoal : PTerm vars const) (goalM : GoalM vars const (Subst vars const))
+ : Except (UnifyError vars const) (Subst vars const) :=
+  goalM.run (init := mkInitGoal initGoal)
+
+partial def runResStream
+  (initGoal : PTerm vars const)
+  (goalMs : RStream (GoalM vars const (Subst vars const)))
+ : RStream (Subst vars const) :=
+  match goalMs.uncons with
+  | none => MLList.nil
+  | some (goalM, rest) =>
+      match runResOne initGoal goalM with
+      | Except.ok s =>
+          MLList.cons s (MLList.thunk <|
+            fun _ => runResStream initGoal rest)
+      | Except.error _ =>
+          runResStream initGoal rest
+
+def Program.run (P : Program vars const) (goal : PTerm vars const) : Subst vars const :=
+  match runResStream goal (P.eval) |>.uncons with
+  | none => Subst.empty
+  | some (s, _) => s
+
+-- Nope!
+-- #eval Program.run test_prog (test_elabPTerm concat(cons(a, cons(b, nil)), cons(c, nil)))
 
 end Program
