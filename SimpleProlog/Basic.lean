@@ -29,13 +29,9 @@ def getVars : PTerm vars const → List vars
   | con _ => []
   | app t1 t2 => (getVars t1) ++ (getVars t2)
 
-def Renaming vars := vars → vars
-
-def rename (t : PTerm vars const) (r : Renaming vars) : PTerm vars const :=
-  match t with
-  | var v => var (r v)
-  | con c => con c
-  | app t1 t2 => app (rename t1 r) (rename t2 r)
+structure Renaming vars where
+  domain : List vars
+  map : vars → vars
 
 structure Subst (vars const : Type) where
   domain : List vars
@@ -104,10 +100,10 @@ def Subst.empty : Subst vars const :=
     map := fun v => var v
   }
 
-def Subst.single (v : vars) (t : PTerm vars const) : Subst vars const :=
+def Subst.add (σ : Subst vars const) (v : vars) (t : PTerm vars const) : Subst vars const :=
   {
-    domain := [v],
-    map := fun _ => t
+    domain := σ.domain.insert v
+    map := fun v' => if v = v' then t else σ.map v'
   }
 
 partial def occurs (v : vars) (t : PTerm vars const) (σ : Subst vars const) : Bool :=
@@ -121,11 +117,7 @@ partial def occurs (v : vars) (t : PTerm vars const) (σ : Subst vars const) : B
 
 def collectVars (t : PTerm vars const) (acc : List vars) : List vars :=
   match t with
-  | var v =>
-    if v ∈ acc then
-      acc
-    else
-      v :: acc
+  | var v => acc.insert v
   | con _ => acc
   | app t1 t2 =>
     let acc1 := collectVars t1 acc
@@ -171,6 +163,7 @@ partial def UnifyM.run {α} (m : UnifyM vars const α) (init : Subst vars const 
  : Except (UnifyError vars const) (Subst vars const) :=
   StateT.run m init |> Except.map Prod.snd
 
+-- TODO: maybe we can actually use `partial_fixpoint` here!
 mutual
 
 partial def unifyAux (eqs : List (EqConstr vars const)) : UnifyM vars const Unit :=
@@ -209,10 +202,7 @@ partial def unifyStepNorm (e : EqConstr vars const)
         throw (UnifyError.occursCheckFailed v t)
       else
         do
-          let s ← get
-          let newSubst := Subst.single v t
-          StateT.set (s.compose newSubst)
-          pure []
+          StateT.modifyGet (fun σ => ([], σ.add v t))
   | (con c1, con c2) =>
     if c1 = c2 then
       pure []
@@ -318,12 +308,14 @@ structure Clause (vars const : Type) where
   body : List (PTerm vars const)
 deriving Repr, Inhabited
 
+instance [ToString vars] [ToString const] : ToString (Clause vars const) where
+  toString c := s!"{c.head} -: {c.body}"
+
 class GenSym (α : Type) where
   genSym : List α → α → α
 
 class LawfulGenSym (α : Type) [DecidableEq α] [GenSym α] where
   genSym_fresh : ∀ (used : List α) (base : α), GenSym.genSym used base ∉ used
-
 
 -- TODO: prove termination.
 partial instance instGenSymString : GenSym String where
@@ -339,111 +331,7 @@ partial instance instGenSymString : GenSym String where
 
 variable [Inhabited vars] [DecidableEq vars] [GenSym vars]
 variable [Repr vars] [Repr const]
-
-#check List.toArray
-
-#check MonadReaderOf
-
-def getUsedVars [MonadReaderOf (List vars) m] : m (List vars) :=
-  MonadReaderOf.read
-
-def getSol [MonadReaderOf (Subst vars const) m] : m (Subst vars const) :=
-  MonadReaderOf.read
-
--- FIXME: I don't know how to do this elegantly.
-def withFreshRenaming
-  [Monad m]
-  [MonadWithReaderOf (List vars) m]
-  [MonadReaderOf (List vars) m]
-(cont : Renaming vars → m α)
- : m α := do
-  let used ← getUsedVars
-  let freshVars := used.map (fun v => GenSym.genSym used v)
-  let freshVarsArray := freshVars.toArray
-  let usedArray := used.toArray
-  let ren : Renaming vars :=
-    fun v =>
-        let idx := usedArray.idxOf? v
-        match idx with
-        | some i => (freshVarsArray[i]!)
-        | none => v
-  -- FIXME: remove dups
-  withReader (fun used => used ++ freshVars) (cont ren)
-
-#check withReader
-
-
-def withFreshClause
-  [Monad m]
-  [MonadWithReaderOf (List vars) m]
-  [MonadReaderOf (List vars) m]
-  (cl : Clause vars const)
-  (cont : Clause vars const → m α)
-  : m α :=
-  withFreshRenaming <| fun r =>
-    let cl' := {
-      head := cl.head.rename r,
-      body := cl.body.map (fun t => t.rename r)
-    }
-  cont cl'
-
-def liftUnify
-  [Monad m]
-  [MonadReaderOf (Subst vars const) m]
-  [MonadExcept (UnifyError vars const) m]
-  (eqs : List (EqConstr vars const))
- : m (Subst vars const) := do
-  let σ ← getSol (vars := vars) (const := const)
-  match Unification.unify eqs σ with
-  | Except.ok s => return s
-  | Except.error err => throw err
-
-def withUnifyM
-  [Monad m]
-  [MonadWithReaderOf (Subst vars const) m]
-  [MonadReaderOf (Subst vars const) m]
-  [MonadExcept (UnifyError vars const) m]
-  (cont : m α)
-  (eqs : List (EqConstr vars const))
- : m α := do
-  let s' ← liftUnify eqs
-  withReader (fun _ => s') cont
-
--- Now we need to freshen the head of a clause, unify it against the goal, and return the updated
--- substitution and body constraints.
-def applyClause
-  [Monad m]
-  [MonadWithReaderOf (Subst vars const) m]
-  [MonadReaderOf (Subst vars const) m]
-  [MonadWithReaderOf (List vars) m]
-  [MonadReaderOf (List vars) m]
-  [MonadExcept (UnifyError vars const) m]
-  (cont : List (PTerm vars const) → m α)
-  (cl : Clause vars const) (t : PTerm vars const)
- : m α := do
-  withReader (fun used => used ++ t.getVars) <| do
-  withFreshClause cl <| fun cl' =>
-    withUnifyM
-      (do
-        let s ← getSol
-        let body' := cl'.body.map (fun b => b.applyFull s)
-        cont body')
-      [{ lhs := cl'.head, rhs := t }]
-
-def withApplyClause
-  [Monad m]
-  [MonadWithReaderOf (Subst vars const) m]
-  [MonadReaderOf (Subst vars const) m]
-  [MonadWithReaderOf (List vars) m]
-  [MonadReaderOf (List vars) m]
-  [MonadExcept (UnifyError vars const) m]
-  [MonadWithReaderOf (List (PTerm vars const)) m]
-  (cl : Clause vars const) (t : PTerm vars const)
-  (cont : m α)
- : m α :=
-  let cont' := fun new_goals =>
-  withReader (fun s => new_goals ++ s) cont
-  applyClause cont' cl t
+variable [ToString vars] [ToString const]
 
 structure PState (vars const : Type) where
   usedVars : List vars
@@ -451,61 +339,39 @@ structure PState (vars const : Type) where
   goals : List (PTerm vars const)
 deriving Inhabited
 
-abbrev GoalM vars const := ExceptT (UnifyError vars const) (ReaderM (PState vars const))
+def mkRenaming (usedVars : List vars) (toFreshen : List vars) : List vars × Subst vars const :=
+  toFreshen.foldl
+  (fun (allVars, σ) v =>
+    if v ∈ σ.domain then (allVars, σ) else
+    let v' := GenSym.genSym allVars v
+    (allVars.insert v', σ.add v (.var v')))
+  (usedVars, Subst.empty)
 
-instance : MonadReaderOf (List vars) (GoalM vars const) where
-  read := do
-    let s : PState vars const ← MonadReaderOf.read
-    return s.usedVars
+def PTerm.freshen (t : PTerm vars const) (usedVars : List vars) : List vars × PTerm vars const :=
+  let (allVars, σ) := mkRenaming usedVars (t.getVars)
+  (allVars, t.apply σ)
 
-instance : MonadReaderOf (Subst vars const) (GoalM vars const) where
-  read := do
-    let s : PState vars const ← MonadReaderOf.read
-    return s.subst
+-- FIXME: this is broken
+def freshen (c : Clause vars const) (usedVars : List vars) : List vars × Clause vars const :=
+  let (allVars, hd) := PTerm.freshen c.head usedVars
+  let (allVars, body) :=
+    c.body.foldl
+    (fun (allVars, bs) b =>
+      let (allVars, b) := PTerm.freshen b allVars
+      (allVars, b::bs))
+    (allVars, [])
+  (allVars, { head := hd, body := body})
 
-instance : MonadReaderOf (List (PTerm vars const)) (GoalM vars const) where
-  read := do
-    let s : PState vars const ← MonadReaderOf.read
-    return s.goals
 
-instance : MonadReaderOf (List (PTerm vars const)) (GoalM vars const) where
-  read := do
-    let s : PState vars const ← MonadReaderOf.read
-    return s.goals
-
-instance : MonadWithReaderOf (List vars) (GoalM vars const) where
-  withReader f cont := do
-    let s : PState vars const ← MonadReaderOf.read
-    let s' := { s with usedVars := f s.usedVars }
-    MonadWithReaderOf.withReader (fun _ => s') cont
-
-instance : MonadWithReaderOf (Subst vars const) (GoalM vars const) where
-  withReader f cont := do
-    let s : PState vars const ← MonadReaderOf.read
-    let s' := { s with subst := f s.subst }
-    MonadWithReaderOf.withReader (fun _ => s') cont
-
-instance : MonadWithReaderOf (List (PTerm vars const)) (GoalM vars const) where
-  withReader f cont := do
-    let s : PState vars const ← MonadReaderOf.read
-    let s' := { s with goals := f s.goals }
-    MonadWithReaderOf.withReader (fun _ => s') cont
-
-def GoalM.run
-  (m : GoalM vars const α)
-  (init : PState vars const := { usedVars := [], subst := Subst.empty, goals := [] })
- : Except (UnifyError vars const) α :=
-  ReaderT.run (ExceptT.run m) init
-
-def testApplyClause
-  (cl : Clause vars const) (t : PTerm vars const)
- : GoalM vars const (List (PTerm vars const)) := do
-  applyClause (fun l => return l) cl t
-
-def testWithApplyClause
-  (cl : Clause vars const) (t : PTerm vars const)
- : GoalM vars const (List (PTerm vars const)) := do
-  withApplyClause cl t read
+def apply (c : Clause vars const) (g : PTerm vars const) (usedVars : List vars) :
+  Except (UnifyError vars const) (List vars × List (PTerm vars const) × Subst vars const) := do
+  let (allVars, c) := freshen c usedVars
+  let eq : EqConstr vars const := ⟨g, c.head⟩
+  dbg_trace s!"applying {c} to {g}"
+  let σ ← unifyOne eq
+  dbg_trace s!"Got {σ}"
+  let newGoals := c.body.map (fun t => t.applyFull σ)
+  return (allVars, newGoals, σ)
 
 
 declare_syntax_cat p_clause
@@ -534,11 +400,6 @@ elab "test_elabPClause " c:p_clause : term => do
 
 #reduce test_elabPClause f(X, Y) -: g(a, Y), h(X)
 
-#eval testApplyClause (test_elabPClause f(X, Y) -: g(a, Y), h(X)) (test_elabPTerm f(b, a)) |> GoalM.run
-#eval testApplyClause (test_elabPClause f(X, Y) -: g(a, Y), h(X)) (test_elabPTerm f(Y, X)) |> GoalM.run
-#eval testWithApplyClause (test_elabPClause f(X, Y) -: g(a, Y), h(X)) (test_elabPTerm f(b, a)) |> GoalM.run
-#eval testWithApplyClause (test_elabPClause f(X, Y) -: g(a, Y), h(X)) (test_elabPTerm f(Y, X)) |> GoalM.run
-
 
 end Clause
 
@@ -552,34 +413,45 @@ variable {vars const : Type}
   [DecidableEq const]
   [Inhabited vars]
   [GenSym vars]
+  [ToString vars]
+  [ToString const]
 
-abbrev RStream := MLList Id
+abbrev Res := Option
 
 structure Program vars const where
-  clauses : RStream (Clause vars const)
+  clauses : List (Clause vars const)
 deriving Inhabited
 
-def Program.ofList (cls : List (Clause vars const)) : Program vars const :=
-  {
-    clauses := MLList.ofList cls
-  }
-
-def Program.step
-  (cl : Clause vars const)
-  (cont : GoalM vars const (Subst vars const))
-  : GoalM vars const (Subst vars const) := do
-  let goals : List (PTerm vars const) ← read
+def select (goals : List (PTerm vars const)) : Option (PTerm vars const × List (PTerm vars const)) :=
   match goals with
-  | [] => MonadReaderOf.read
-  | g::_ =>
-      Clause.withApplyClause cl g cont
+  | [] => none
+  | g :: gs => some (g, gs)
 
+#check tryCatch
 
-partial def Program.eval
+partial def runBody
   (P : Program vars const)
-  : RStream (GoalM vars const (Subst vars const)) := do
-  let cl ← P.clauses
-  Program.step cl <$> (Program.eval P)
+  (goals : List (PTerm vars const))
+  (currentSol : Subst vars const)
+  (usedVars : List vars) : Res (Subst vars const) := do
+  match select goals with
+  | none => currentSol
+  | some (g, gs) =>
+    for c in P.clauses do
+      let newGoals := Clause.apply c g usedVars
+      match newGoals with
+      | .ok (allVars, newGoals, newSubst) =>
+        dbg_trace s!"new goals {newGoals}"
+        let goals := newGoals ++ gs
+        let sol ← runBody P goals newSubst allVars
+        return sol
+      | .error _ =>
+        dbg_trace "failed."
+        continue
+    throw ()
+
+def run (P : Program vars const) (goal : PTerm vars const) : Res (Subst vars const) :=
+  runBody P [goal] Subst.empty goal.getVars
 
 private def test_clause_1 : Clause String String :=
   test_elabPClause concat(nil, X, X) -:
@@ -587,42 +459,11 @@ private def test_clause_1 : Clause String String :=
 private def test_clause_2 : Clause String String :=
   test_elabPClause concat(cons(X, Y), Z, cons(X, W)) -: concat(Y, Z, W)
 
-private def test_prog : Program String String := Program.ofList [test_clause_1, test_clause_2]
+private def test_prog : Program String String := ⟨[test_clause_1, test_clause_2]⟩
 
 private def test_goal : PTerm String String :=
-  test_elabPTerm concat(cons(a, cons(b, nil)), cons(c, nil))
+  test_elabPTerm concat(cons(a, cons(b, nil)), cons(c, nil), O)
 
-def mkInitGoal (goal : PTerm vars const) : PState vars const :=
-  {
-    usedVars := goal.getVars,
-    subst := Subst.empty,
-    goals := [goal]
-  }
-
-def runResOne (initGoal : PTerm vars const) (goalM : GoalM vars const (Subst vars const))
- : Except (UnifyError vars const) (Subst vars const) :=
-  goalM.run (init := mkInitGoal initGoal)
-
-partial def runResStream
-  (initGoal : PTerm vars const)
-  (goalMs : RStream (GoalM vars const (Subst vars const)))
- : RStream (Subst vars const) :=
-  match goalMs.uncons with
-  | none => MLList.nil
-  | some (goalM, rest) =>
-      match runResOne initGoal goalM with
-      | Except.ok s =>
-          MLList.cons s (MLList.thunk <|
-            fun _ => runResStream initGoal rest)
-      | Except.error _ =>
-          runResStream initGoal rest
-
-def Program.run (P : Program vars const) (goal : PTerm vars const) : Subst vars const :=
-  match runResStream goal (P.eval) |>.uncons with
-  | none => Subst.empty
-  | some (s, _) => s
-
--- Nope!
--- #eval Program.run test_prog (test_elabPTerm concat(cons(a, cons(b, nil)), cons(c, nil)))
+#eval run test_prog test_goal
 
 end Program
