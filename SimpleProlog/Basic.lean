@@ -351,24 +351,27 @@ def PTerm.freshen (t : PTerm vars const) (usedVars : List vars) : List vars × P
   let (allVars, σ) := mkRenaming usedVars (t.getVars)
   (allVars, t.apply σ)
 
+def addAll [BEq α] (l₁ l₂ : List α) :=
+  l₂.foldl (fun l a => l.insert a) l₁
+
 -- FIXME: this is broken
 def freshen (c : Clause vars const) (usedVars : List vars) : List vars × Clause vars const :=
-  let (allVars, hd) := PTerm.freshen c.head usedVars
-  let (allVars, body) :=
-    c.body.foldl
-    (fun (allVars, bs) b =>
-      let (allVars, b) := PTerm.freshen b allVars
-      (allVars, b::bs))
-    (allVars, [])
-  (allVars, { head := hd, body := body})
+  let allVars := c.head.getVars
+  let allVars := c.body.foldl (fun all l => addAll all l.getVars) allVars
+  let (allVars, σ) := mkRenaming usedVars allVars
+  (allVars, { head := c.head.apply σ, body := c.body.map (apply · σ)})
 
 
-def apply (c : Clause vars const) (g : PTerm vars const) (usedVars : List vars) :
+def apply
+  (c : Clause vars const)
+  (g : PTerm vars const)
+  (σ : Subst vars const)
+  (usedVars : List vars) :
   Except (UnifyError vars const) (List vars × List (PTerm vars const) × Subst vars const) := do
   let (allVars, c) := freshen c usedVars
   let eq : EqConstr vars const := ⟨g, c.head⟩
   dbg_trace s!"applying {c} to {g}"
-  let σ ← unifyOne eq
+  let σ ← unifyOne eq σ
   dbg_trace s!"Got {σ}"
   let newGoals := c.body.map (fun t => t.applyFull σ)
   return (allVars, newGoals, σ)
@@ -438,7 +441,7 @@ partial def runBody
   | none => currentSol
   | some (g, gs) =>
     for c in P.clauses do
-      let newGoals := Clause.apply c g usedVars
+      let newGoals := Clause.apply c g currentSol usedVars
       match newGoals with
       | .ok (allVars, newGoals, newSubst) =>
         dbg_trace s!"new goals {newGoals}"
