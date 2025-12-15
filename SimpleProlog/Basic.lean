@@ -339,6 +339,8 @@ structure PState (vars const : Type) where
   goals : List (PTerm vars const)
 deriving Inhabited
 
+abbrev PrologST vars const := StateM (PState vars const)
+
 def mkRenaming (usedVars : List vars) (toFreshen : List vars) : List vars × Subst vars const :=
   toFreshen.foldl
   (fun (allVars, σ) v =>
@@ -354,7 +356,6 @@ def PTerm.freshen (t : PTerm vars const) (usedVars : List vars) : List vars × P
 def addAll [BEq α] (l₁ l₂ : List α) :=
   l₂.foldl (fun l a => l.insert a) l₁
 
--- FIXME: this is broken
 def freshen (c : Clause vars const) (usedVars : List vars) : List vars × Clause vars const :=
   let allVars := c.head.getVars
   let allVars := c.body.foldl (fun all l => addAll all l.getVars) allVars
@@ -364,17 +365,17 @@ def freshen (c : Clause vars const) (usedVars : List vars) : List vars × Clause
 
 def apply
   (c : Clause vars const)
-  (g : PTerm vars const)
-  (σ : Subst vars const)
-  (usedVars : List vars) :
-  Except (UnifyError vars const) (List vars × List (PTerm vars const) × Subst vars const) := do
-  let (allVars, c) := freshen c usedVars
+  (g : PTerm vars const) :
+  ExceptT (UnifyError vars const) (PrologST vars const) Unit := do
+  let st ← get
+  let (allVars, c) := freshen c st.usedVars
   let eq : EqConstr vars const := ⟨g, c.head⟩
   dbg_trace s!"applying {c} to {g}"
-  let σ ← unifyOne eq σ
+  let σ ← unifyOne eq st.subst
   dbg_trace s!"Got {σ}"
   let newGoals := c.body.map (fun t => t.applyFull σ)
-  return (allVars, newGoals, σ)
+  modify ({· with goals := newGoals, usedVars := allVars, subst := σ})
+  return ()
 
 
 declare_syntax_cat p_clause
@@ -434,27 +435,32 @@ def select (goals : List (PTerm vars const)) : Option (PTerm vars const × List 
 
 partial def runBody
   (P : Program vars const)
-  (goals : List (PTerm vars const))
-  (currentSol : Subst vars const)
-  (usedVars : List vars) : Res (Subst vars const) := do
-  match select goals with
-  | none => currentSol
+  : PrologST vars const (Res (Subst vars const)) := do
+  let st ← get
+  match select st.goals with
+  | none => return st.subst
   | some (g, gs) =>
     for c in P.clauses do
-      let newGoals := Clause.apply c g currentSol usedVars
+      let newGoals ← Clause.apply c g |> ExceptT.run
       match newGoals with
-      | .ok (allVars, newGoals, newSubst) =>
+      | .ok () => do
+        let st ← get
         dbg_trace s!"new goals {newGoals}"
-        let goals := newGoals ++ gs
-        let sol ← runBody P goals newSubst allVars
+        modify ({ · with goals := st.goals ++ gs})
+        let sol ← runBody P
         return sol
       | .error _ =>
         dbg_trace "failed."
         continue
-    throw ()
+    return failure
 
 def run (P : Program vars const) (goal : PTerm vars const) : Res (Subst vars const) :=
-  runBody P [goal] Subst.empty goal.getVars
+  (runBody P).run' ⟨goal.getVars, Subst.empty, [goal]⟩
+
+-- Not quite what we want: we want to list the values for the vars in the goal.
+def giveSolution (P : Program vars const) (goal : PTerm vars const) : Res (PTerm vars const) := do
+  let σ ← run P goal
+  return goal.applyFull σ
 
 private def test_clause_1 : Clause String String :=
   test_elabPClause concat(nil, X, X) -:
@@ -467,6 +473,6 @@ private def test_prog : Program String String := ⟨[test_clause_1, test_clause_
 private def test_goal : PTerm String String :=
   test_elabPTerm concat(cons(a, cons(b, nil)), cons(c, nil), O)
 
-#eval run test_prog test_goal
+#eval giveSolution test_prog test_goal
 
 end Program
